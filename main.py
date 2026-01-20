@@ -3,7 +3,7 @@
 # Lee presión con BMP180/BMP085 (I2C 0x77)
 # Convierte a altitud 
 # Calibra una altura base (referencia 0) al inicio
-# imprime en el monitor serial la altura cada 0.5 s
+# imprime en el monitor serial la altura cada 0.5
 
 
 from machine import I2C, Pin  # I2C y pines del ESP32-S3
