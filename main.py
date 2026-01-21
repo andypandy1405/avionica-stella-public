@@ -1,25 +1,26 @@
 from machine import I2C, Pin, UART
 import time
+import sys
+import uselect
 
 # =========================
-# CONFIG PINES
+# PINES (AJUSTADOS)
 # =========================
 I2C_SDA = 17
 I2C_SCL = 16
 
-GPS_RX = 18  # ESP32 RX  <- GPS TX
-GPS_TX = 19  # ESP32 TX  -> GPS RX
+GPS_RX = 11  # ESP32 RX  <- GPS TX
+GPS_TX = 10  # ESP32 TX  -> GPS RX
 GPS_BAUD = 9600
 
 # =========================
-# CONSTANTES / CONFIG
+# CONFIG
 # =========================
 SEA_LEVEL_PA = 101325
 G0 = 9.80665
 
-IMU_LOOP_MS = 10        # ~100 Hz
-PRINT_PERIOD_MS = 200   # 5 Hz (más legible; cámbialo a 100 si quieres 10 Hz)
-
+IMU_LOOP_MS = 10        # ~100 Hz interno
+PRINT_PERIOD_MS = 200   # 5 Hz telemetría (más estable)
 ALT_ALPHA = 0.15
 VBARO_ALPHA = 0.20
 W_IMU = 0.90
@@ -111,7 +112,7 @@ class BMP180:
         p = p + ((x1 + x2 + 3791) >> 4)
         return int(p)
 
-    def altitude_m(self, sea_level_pa=101325):
+    def altitude_m(self, sea_level_pa=SEA_LEVEL_PA):
         p = self.pressure_pa()
         return 44330.0 * (1.0 - (p / sea_level_pa) ** 0.1903)
 
@@ -135,6 +136,7 @@ def _twos16(msb, lsb):
 
 class MPU6050:
     def __init__(self, i2c, addr=0x68, gyro_fs=3, accel_fs=3):
+        # gyro_fs=3 => ±2000 dps; accel_fs=3 => ±16 g
         self.i2c = i2c
         self.addr = addr
         self.i2c.writeto_mem(self.addr, MPU_PWR_MGMT_1, b"\x00")
@@ -165,7 +167,7 @@ class MPU6050:
         return ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
 
 # =========================
-# GPS NMEA parser mínimo
+# GPS (NEO-6M) NMEA mínimo
 # =========================
 def _nmea_degmin_to_deg(dm, hemi):
     if not dm:
@@ -248,17 +250,17 @@ class GPS:
                 self.alt_m = None
 
 # =========================
-# INIT
+# INIT BUSES + SENSORES
 # =========================
 i2c = I2C(0, sda=Pin(I2C_SDA), scl=Pin(I2C_SCL), freq=400000)
 uart = UART(1, baudrate=GPS_BAUD, rx=Pin(GPS_RX), tx=Pin(GPS_TX))
 gps = GPS(uart)
 
-print("\n=== TELEMETRÍA (GY-87 + GPS) ===")
+print("\n=== SISTEMA LISTO (GY-87 + GPS) ===")
 time.sleep_ms(200)
 
 devices = i2c.scan()
-print("I2C:", [hex(d) for d in devices])
+print("I2C detectados:", [hex(d) for d in devices])
 
 if BMP180_ADDR not in devices:
     print("ERROR: BMP180 (0x77) no detectado.")
@@ -278,31 +280,12 @@ if mpu_addr is None:
 bmp = BMP180(i2c, addr=BMP180_ADDR, oss=0)
 mpu = MPU6050(i2c, addr=mpu_addr, gyro_fs=3, accel_fs=3)
 
-print("Sensores OK. Calibrando (quieto)...")
+# =========================
+# ESTADO GLOBAL (calibración + velocidades)
+# =========================
+alt0 = 0.0
+az0_g = 0.0
 
-# Calibrar altura base
-alts = []
-for _ in range(30):
-    alts.append(bmp.altitude_m(SEA_LEVEL_PA))
-    time.sleep_ms(50)
-alt0 = mean(alts)
-
-# Baseline Z (gravedad + bias)
-azs = []
-for _ in range(200):
-    ax_g, ay_g, az_g, gx, gy, gz = mpu.read()
-    azs.append(az_g)
-    time.sleep_ms(5)
-az0_g = mean(azs)
-
-print("Alt0=%.2f m | az0=%.4f g" % (alt0, az0_g))
-print("\nMostrando datos con etiquetas:\n")
-
-# Cabecera (una vez)
-print("t(ms) | ALT_rel(m) | V_baro(m/s) V_imu(m/s) V_fused(m/s) | "
-      "ACC(m/s^2) X Y Z | GYRO(dps) X Y Z | GPS fix sats lat lon alt(m) spd(m/s)")
-
-# Estados
 alt_rel_f = None
 alt_rel_prev = None
 v_baro_f = 0.0
@@ -310,9 +293,48 @@ v_imu = 0.0
 v_fused = 0.0
 
 t_prev_us = time.ticks_us()
-t_print_prev = time.ticks_ms()
 
-while True:
+def reset_states():
+    global alt_rel_f, alt_rel_prev, v_baro_f, v_imu, v_fused, t_prev_us
+    alt_rel_f = None
+    alt_rel_prev = None
+    v_baro_f = 0.0
+    v_imu = 0.0
+    v_fused = 0.0
+    t_prev_us = time.ticks_us()
+
+def calibrate():
+    global alt0, az0_g
+    print("\n[CMD 1] CALIBRACIÓN (mantén quieto 2-3s)")
+    # Altura base
+    alts = []
+    for _ in range(30):
+        alts.append(bmp.altitude_m(SEA_LEVEL_PA))
+        time.sleep_ms(50)
+    alt0 = mean(alts)
+
+    # Baseline Z (gravedad + bias)
+    azs = []
+    for _ in range(200):
+        gps.update()
+        ax_g, ay_g, az_g, gx, gy, gz = mpu.read()
+        azs.append(az_g)
+        time.sleep_ms(5)
+    az0_g = mean(azs)
+
+    reset_states()
+    print("OK -> alt0(abs)=%.2f m | az0=%.4f g\n" % (alt0, az0_g))
+
+def read_altitude_once():
+    # Baro
+    alt_abs = bmp.altitude_m(SEA_LEVEL_PA)
+    alt_rel = alt_abs - alt0
+    return alt_abs, alt_rel
+
+def update_velocities(alt_rel, az_g):
+    # Actualiza v_baro_f, v_imu, v_fused usando dt real
+    global alt_rel_f, alt_rel_prev, v_baro_f, v_imu, v_fused, t_prev_us
+
     # dt
     t_now_us = time.ticks_us()
     dt_us = time.ticks_diff(t_now_us, t_prev_us)
@@ -321,26 +343,18 @@ while True:
     if dt > 0.05:
         dt = 0.05
 
-    # GPS update
-    gps.update()
+    # IMU integración (Z dinámica)
+    az_mps2 = (az_g - az0_g) * G0
+    v_imu += az_mps2 * dt
 
-    # IMU
-    ax_g, ay_g, az_g, gx, gy, gz = mpu.read()
-    ax = ax_g * G0
-    ay = ay_g * G0
-    az = (az_g - az0_g) * G0  # Z dinámica
-    v_imu += az * dt
-
-    # Baro
-    alt_abs = bmp.altitude_m(SEA_LEVEL_PA)
-    alt_rel = alt_abs - alt0
-
+    # Altitud filtrada
     if alt_rel_f is None:
         alt_rel_f = alt_rel
         alt_rel_prev = alt_rel_f
     else:
         alt_rel_f = ALT_ALPHA * alt_rel + (1.0 - ALT_ALPHA) * alt_rel_f
 
+    # Velocidad baro
     v_baro = (alt_rel_f - alt_rel_prev) / dt
     alt_rel_prev = alt_rel_f
     v_baro_f = VBARO_ALPHA * v_baro + (1.0 - VBARO_ALPHA) * v_baro_f
@@ -348,29 +362,144 @@ while True:
     # Fusión
     v_fused = W_IMU * v_imu + (1.0 - W_IMU) * v_baro_f
 
-    # Print con etiquetas (periodo)
-    if time.ticks_diff(time.ticks_ms(), t_print_prev) >= PRINT_PERIOD_MS:
-        t_print_prev = time.ticks_ms()
+    return dt, az_mps2
 
-        # GPS strings
-        lat = "--" if gps.lat is None else ("%.6f" % gps.lat)
-        lon = "--" if gps.lon is None else ("%.6f" % gps.lon)
-        galt = "--" if gps.alt_m is None else ("%.1f" % gps.alt_m)
-        gspd = "--" if gps.spd_mps is None else ("%.2f" % gps.spd_mps)
+def print_menu():
+    print("Comandos:")
+    print("  1) Calibrar (altura base + accel Z baseline)")
+    print("  2) 10 datos: Altura relativa")
+    print("  3) 10 datos: Giroscopio (X,Y,Z)")
+    print("  4) 10 datos: Presión (Pa)")
+    print("  5) Telemetría completa (salir con 'q' + Enter)")
+    print("  m) Mostrar menú")
+    print("")
 
-        print(
-            "%6d | %9.2f | %10.2f %9.2f %11.2f | "
-            "%8.2f %8.2f %8.2f | %8.1f %8.1f %8.1f | "
-            "%3d %3d %s %s %s %s"
-            % (
-                time.ticks_ms(),
-                alt_rel_f,
-                v_baro_f, v_imu, v_fused,
-                ax, ay, az,
-                gx, gy, gz,
-                gps.fix, gps.sats,
-                lat, lon, galt, gspd
+def read_cmd_line():
+    # En MicroPython, sys.stdout puede no tener flush()
+    try:
+        sys.stdout.write("CMD> ")
+    except:
+        print("CMD> ", end="")  # respaldo
+
+    line = sys.stdin.readline()
+    if not line:
+        return ""
+    return line.strip()
+
+# =========================
+# TELEMETRÍA (CMD 5) - sale con 'q'
+# =========================
+def telemetry_loop():
+    print("\n[CMD 5] TELEMETRÍA COMPLETA (q + Enter para salir)\n")
+    print("t(ms) | ALT_rel(m) | V_baro(m/s) V_imu(m/s) V_fused(m/s) | "
+          "ACC(m/s^2) X Y Z | GYRO(dps) X Y Z | GPS fix sats lat lon alt(m) spd(m/s)")
+
+    poll = uselect.poll()
+    poll.register(sys.stdin, uselect.POLLIN)
+
+    t_print_prev = time.ticks_ms()
+
+    while True:
+        # salir si entra 'q'
+        if poll.poll(0):
+            s = sys.stdin.readline().strip()
+            if s.lower() == "q":
+                print("\nSaliendo de telemetría.\n")
+                return
+
+        gps.update()
+
+        # IMU
+        ax_g, ay_g, az_g, gx, gy, gz = mpu.read()
+        ax = ax_g * G0
+        ay = ay_g * G0
+
+        # Baro
+        alt_abs, alt_rel = read_altitude_once()
+
+        # Velocidades
+        dt, az_dyn = update_velocities(alt_rel, az_g)
+
+        # Print limitado
+        if time.ticks_diff(time.ticks_ms(), t_print_prev) >= PRINT_PERIOD_MS:
+            t_print_prev = time.ticks_ms()
+
+            lat = "--" if gps.lat is None else ("%.6f" % gps.lat)
+            lon = "--" if gps.lon is None else ("%.6f" % gps.lon)
+            galt = "--" if gps.alt_m is None else ("%.1f" % gps.alt_m)
+            gspd = "--" if gps.spd_mps is None else ("%.2f" % gps.spd_mps)
+
+            print(
+                "%6d | %9.2f | %10.2f %9.2f %11.2f | "
+                "%8.2f %8.2f %8.2f | %8.1f %8.1f %8.1f | "
+                "%3d %3d %s %s %s %s"
+                % (
+                    time.ticks_ms(),
+                    alt_rel_f if alt_rel_f is not None else alt_rel,
+                    v_baro_f, v_imu, v_fused,
+                    ax, ay, az_dyn,
+                    gx, gy, gz,
+                    gps.fix, gps.sats,
+                    lat, lon, galt, gspd
+                )
             )
-        )
 
-    time.sleep_ms(IMU_LOOP_MS)
+        time.sleep_ms(IMU_LOOP_MS)
+
+# =========================
+# COMANDOS 2-4 (10 muestras)
+# =========================
+def cmd_altitude_10():
+    print("\n[CMD 2] 10 DATOS ALTURA (relativa)\n")
+    for i in range(10):
+        gps.update()
+        alt_abs, alt_rel = read_altitude_once()
+        print("%2d) ALT_rel = %8.2f m | ALT_abs = %8.2f m" % (i+1, alt_rel, alt_abs))
+        time.sleep_ms(200)
+    print("")
+
+def cmd_gyro_10():
+    print("\n[CMD 3] 10 DATOS GIROSCOPIO (°/s)\n")
+    for i in range(10):
+        gps.update()
+        ax_g, ay_g, az_g, gx, gy, gz = mpu.read()
+        print("%2d) GYRO X=%8.2f  Y=%8.2f  Z=%8.2f  (dps)" % (i+1, gx, gy, gz))
+        time.sleep_ms(200)
+    print("")
+
+def cmd_pressure_10():
+    print("\n[CMD 4] 10 DATOS PRESIÓN (Pa)\n")
+    for i in range(10):
+        gps.update()
+        p = bmp.pressure_pa()
+        print("%2d) P = %d Pa" % (i+1, p))
+        time.sleep_ms(200)
+    print("")
+
+# =========================
+# MAIN
+# =========================
+print_menu()
+print("Sugerencia: ejecuta primero CMD 1 (calibrar)\n")
+
+while True:
+    cmd = read_cmd_line().lower()
+
+    if cmd == "1":
+        calibrate()
+    elif cmd == "2":
+        cmd_altitude_10()
+    elif cmd == "3":
+        cmd_gyro_10()
+    elif cmd == "4":
+        cmd_pressure_10()
+    elif cmd == "5":
+        telemetry_loop()
+        print_menu()
+    elif cmd == "m":
+        print_menu()
+    elif cmd in ("exit", "quit"):
+        print("Saliendo.")
+        break
+    else:
+        print("Comando no válido. Escribe 'm' para menú.\n")
